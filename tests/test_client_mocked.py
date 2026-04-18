@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 import pytest
 
 from ow2_mcp import protocol as p
-from ow2_mcp.client import TrapClient
+from ow2_mcp.client import TrapClient, send_interrupt
 from ow2_mcp.errors import (
     AlreadyConnectedError,
     NotConnectedError,
@@ -236,7 +236,7 @@ async def test_read_regs_then_write_regs() -> None:
     script = [
         (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
         (bytes([Req.READ_REGS]), reg_data),
-        (bytes([Req.WRITE_REGS]) + reg_data, None),  # no reply expected
+        (bytes([Req.WRITE_REGS]) + reg_data, b""),
     ]
     async with _server(_scripted(script)) as (host, port):
         client = TrapClient()
@@ -287,7 +287,7 @@ async def test_set_break_returns_old_and_clear_break_echoes_it() -> None:
     script = [
         (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
         (p.pack_set_break_req(p.Addr48(offset=0x400, segment=1)), b"\xcc\x00\x00\x00"),
-        (p.pack_clear_break_req(p.Addr48(offset=0x400, segment=1), 0xCC), None),
+        (p.pack_clear_break_req(p.Addr48(offset=0x400, segment=1), 0xCC), b""),
     ]
     async with _server(_scripted(script)) as (host, port):
         client = TrapClient()
@@ -371,3 +371,278 @@ async def test_prog_go_zero_byte_reply_has_hint() -> None:
         with pytest.raises(ProtocolError) as excinfo:
             await client.prog_go()
         assert "state corruption" in str(excinfo.value).lower()
+
+
+async def test_send_interrupt_suspend_uses_one_shot_connection() -> None:
+    seen: list[bytes] = []
+    eof = asyncio.Event()
+
+    async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        seen.append(await _read_packet(reader))
+        tail = await reader.read()
+        assert tail == b""
+        eof.set()
+
+    async with _server(_handler) as (host, port):
+        await send_interrupt(host, port)
+        await asyncio.wait_for(eof.wait(), timeout=1.0)
+    assert seen == [p.pack_suspend_req()]
+
+
+async def test_send_interrupt_resume_uses_resume_opcode() -> None:
+    seen: list[bytes] = []
+    eof = asyncio.Event()
+
+    async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        seen.append(await _read_packet(reader))
+        tail = await reader.read()
+        assert tail == b""
+        eof.set()
+
+    async with _server(_handler) as (host, port):
+        await send_interrupt(host, port, resume=True)
+        await asyncio.wait_for(eof.wait(), timeout=1.0)
+    assert seen == [p.pack_resume_req()]
+
+
+async def test_get_supplementary_service_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_get_supplementary_service_req("files"), b"\x00\x00\x00\x00\x34\x12\x00\x00"),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.get_supplementary_service("files")
+        assert result.err == 0
+        assert result.shandle == 0x1234
+
+
+async def test_map_addr_does_not_substitute_flat_segment() -> None:
+    map_reply = b"\x00\x20\x00\x00\x00\x00\x11\x11\x11\x11\x22\x22\x22\x22"
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_map_addr_req(p.Addr48(offset=0x2000, segment=0), 0x99), map_reply),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.map_addr(0x2000, 0, mod_handle=0x99)
+        assert result.out_addr.offset == 0x2000
+        assert result.out_addr.segment == 0
+
+
+async def test_map_addr_flat_code_uses_magic_selector() -> None:
+    map_reply = b"\x00\x20\x00\x00\x23\x00\x11\x11\x11\x11\x22\x22\x22\x22"
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (
+            p.pack_map_addr_req(
+                p.Addr48(offset=0x2000, segment=p.MAP_FLAT_CODE_SELECTOR),
+                0x99,
+            ),
+            map_reply,
+        ),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.map_addr(0x2000, mod_handle=0x99, space="flat_code")
+        assert result.out_addr.segment == 0x0023
+
+
+async def test_map_addr_flat_data_uses_magic_selector() -> None:
+    map_reply = b"\x34\x12\x00\x00\x24\x00\x11\x11\x11\x11\x22\x22\x22\x22"
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (
+            p.pack_map_addr_req(
+                p.Addr48(offset=0x1234, segment=p.MAP_FLAT_DATA_SELECTOR),
+                0x77,
+            ),
+            map_reply,
+        ),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.map_addr(0x1234, mod_handle=0x77, space="flat_data")
+        assert result.out_addr.segment == 0x0024
+
+
+async def test_map_addr_invalid_space_rejected() -> None:
+    script = [(b"\x00\x12\x00\x00", b"\x00\x04\x00")]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        with pytest.raises(ValueError, match="invalid MAP_ADDR space"):
+            await client.map_addr(0x2000, space="flat")
+
+
+async def test_checksum_mem_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_checksum_mem_req(p.Addr48(offset=0x1000, segment=1), 16), b"\xef\xbe\xad\xde"),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        checksum = await client.checksum_mem(0x1000, 16, segment=1)
+        assert checksum == 0xDEADBEEF
+
+
+async def test_checksum_mem_substitutes_cached_flat_ds() -> None:
+    reg_block = _x86_reg_block(ds=0x0023, cs=0x001B)
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (bytes([Req.READ_REGS]), reg_block),
+        (p.pack_checksum_mem_req(p.Addr48(offset=0x1000, segment=0x0023), 16), b"\x78\x56\x34\x12"),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        checksum = await client.checksum_mem(0x1000, 16)
+        assert checksum == 0x12345678
+
+
+async def test_read_io_and_write_io_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_read_io_req(0x3F8, 4), b"\xaa\xbb\xcc\xdd"),
+        (p.pack_write_io_req(0x3F8, b"\x11\x22"), b"\x02"),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        assert await client.read_io(0x3F8, 4) == b"\xaa\xbb\xcc\xdd"
+        assert await client.write_io(0x3F8, b"\x11\x22") == 2
+
+
+async def test_get_next_alias_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_get_next_alias_req(0x1234), b"\x34\x12\x78\x56"),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.get_next_alias(0x1234)
+        assert result.seg == 0x1234
+        assert result.alias == 0x5678
+
+
+async def test_set_watch_and_clear_watch_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (
+            p.pack_set_watch_req(p.Addr48(offset=0x2000, segment=1), 4),
+            b"\x01\x00\x00\x00\x04\x00\x00\x00",
+        ),
+        (p.pack_clear_watch_req(p.Addr48(offset=0x2000, segment=1), 4), b""),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.set_watch(0x2000, 4, segment=1)
+        assert result.err == 1
+        assert result.multiplier == 4
+        await client.clear_watch(0x2000, 4, segment=1)
+
+
+async def test_set_and_clear_watch_substitute_cached_flat_ds() -> None:
+    reg_block = _x86_reg_block(ds=0x0023, cs=0x001B)
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (bytes([Req.READ_REGS]), reg_block),
+        (
+            p.pack_set_watch_req(p.Addr48(offset=0x2000, segment=0x0023), 2),
+            b"\x00\x00\x00\x00\x01\x00\x00\x00",
+        ),
+        (p.pack_clear_watch_req(p.Addr48(offset=0x2000, segment=0x0023), 2), b""),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.set_watch(0x2000, 2)
+        assert result.multiplier == 1
+        await client.clear_watch(0x2000, 2)
+
+
+async def test_set_user_screen_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_set_user_screen_req(), b""),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        await client.set_user_screen()
+
+
+async def test_set_debug_screen_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_set_debug_screen_req(), b""),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        await client.set_debug_screen()
+
+
+async def test_keyboard_lib_redirect_and_split_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_read_user_keyboard_req(250), b"A"),
+        (p.pack_get_lib_name_req(0), b"\x34\x12\x00\x00watcom.dll\x00"),
+        (p.pack_redirect_stdin_req("input.txt"), b"\x00\x00\x00\x00"),
+        (p.pack_redirect_stdout_req("output.txt"), b"\x05\x00\x00\x00"),
+        (p.pack_split_cmd_req("prog arg"), b"\x04\x00\x05\x00"),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        assert await client.read_user_keyboard(250) == 0x41
+        lib = await client.get_lib_name(0)
+        assert lib.mod_handle == 0x1234
+        assert lib.name == "watcom.dll"
+        assert await client.redirect_stdin("input.txt") == 0
+        assert await client.redirect_stdout("output.txt") == 5
+        split = await client.split_cmd("prog arg")
+        assert split.cmd_end == 4
+        assert split.parm_start == 5
+
+
+async def test_machine_data_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (
+            p.pack_machine_data_req(2, p.Addr48(offset=0x3000, segment=1), b"\xaa\xbb"),
+            b"\x00\x10\x00\x00\x00\x20\x00\x00\xde\xad",
+        ),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.machine_data(2, 0x3000, segment=1, extra=b"\xaa\xbb")
+        assert result.cache_start == 0x1000
+        assert result.cache_end == 0x2000
+        assert result.extra == b"\xde\xad"
+
+
+async def test_machine_data_substitutes_cached_flat_ds() -> None:
+    reg_block = _x86_reg_block(ds=0x0023, cs=0x001B)
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (bytes([Req.READ_REGS]), reg_block),
+        (
+            p.pack_machine_data_req(1, p.Addr48(offset=0x4000, segment=0x0023), b"\x99"),
+            b"\x00\x10\x00\x00\x00\x20\x00\x00",
+        ),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.machine_data(1, 0x4000, extra=b"\x99")
+        assert result.cache_start == 0x1000
+        assert result.cache_end == 0x2000

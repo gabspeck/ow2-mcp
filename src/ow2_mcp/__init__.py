@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .client import ConnectResult, LoadedProgram, TrapClient
+from .client import ConnectResult, LoadedProgram, TrapClient, send_interrupt
 from .errors import (
     AlreadyConnectedError,
     NotConnectedError,
@@ -25,4 +25,5 @@ __all__ = [
     "TrapError",
     "TrapServerError",
     "__version__",
+    "send_interrupt",
 ]

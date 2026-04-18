@@ -153,6 +153,120 @@ def test_parse_get_message_text_ret() -> None:
     assert msg.text == "halt"
 
 
+def test_pack_suspend_and_resume_req_shape() -> None:
+    assert p.pack_suspend_req() == b"\x02"
+    assert p.pack_resume_req() == b"\x03"
+
+
+def test_get_supplementary_service_round_trip() -> None:
+    assert p.pack_get_supplementary_service_req("files") == b"\x04files\x00"
+    result = p.parse_get_supplementary_service_ret(b"\x00\x00\x00\x00\x34\x12\x00\x00")
+    assert result == p.SupplementaryServiceResult(err=0, shandle=0x1234)
+
+
+def test_perform_supplementary_service_req_shape() -> None:
+    req = p.pack_perform_supplementary_service_req(0x11223344, b"\xaa\xbb")
+    assert req == b"\x05\x44\x33\x22\x11\xaa\xbb"
+
+
+def test_pack_map_addr_req_and_parse_reply() -> None:
+    req = p.pack_map_addr_req(Addr48(offset=0x12345678, segment=0x9ABC), 0x01020304)
+    assert req == b"\x07\x78\x56\x34\x12\xbc\x9a\x04\x03\x02\x01"
+    reply = b"\x00\x10\x00\x00\x23\x00\x11\x11\x11\x11\x22\x22\x22\x22"
+    result = p.parse_map_addr_ret(reply)
+    assert result.out_addr == Addr48(offset=0x1000, segment=0x0023)
+    assert result.lo_bound == 0x11111111
+    assert result.hi_bound == 0x22222222
+
+
+def test_map_flat_selector_constants() -> None:
+    assert p.MAP_FLAT_CODE_SELECTOR == 0xFFFF
+    assert p.MAP_FLAT_DATA_SELECTOR == 0xFFFE
+
+
+def test_pack_checksum_mem_req_and_parse_reply() -> None:
+    req = p.pack_checksum_mem_req(Addr48(offset=0x1000, segment=0x0023), 0x0040)
+    assert req == b"\x08\x00\x10\x00\x00\x23\x00\x40\x00"
+    assert p.parse_checksum_mem_ret(b"\xef\xbe\xad\xde") == 0xDEADBEEF
+
+
+def test_pack_read_io_req_and_write_io_round_trip() -> None:
+    assert p.pack_read_io_req(0x3F8, 4) == b"\x0b\xf8\x03\x00\x00\x04"
+    assert p.pack_write_io_req(0x3F8, b"\xaa\x55") == b"\x0c\xf8\x03\x00\x00\xaa\x55"
+    assert p.parse_write_io_ret(b"\x02") == 2
+
+
+def test_pack_set_watch_and_clear_watch_round_trip() -> None:
+    set_req = p.pack_set_watch_req(Addr48(offset=0x2000, segment=0x0023), 4)
+    clear_req = p.pack_clear_watch_req(Addr48(offset=0x2000, segment=0x0023), 4)
+    assert set_req == b"\x11\x00\x20\x00\x00\x23\x00\x04"
+    assert clear_req == b"\x12\x00\x20\x00\x00\x23\x00\x04"
+    result = p.parse_set_watch_ret(b"\x01\x00\x00\x00\x04\x00\x00\x00")
+    assert result == p.SetWatchResult(err=1, multiplier=4)
+
+
+def test_alias_screen_keyboard_lib_redirect_split_and_machine_data_round_trip() -> None:
+    assert p.pack_get_next_alias_req(0x1234) == b"\x15\x34\x12"
+    assert p.parse_get_next_alias_ret(b"\x34\x12\x78\x56") == p.AliasResult(0x1234, 0x5678)
+    assert p.pack_set_user_screen_req() == b"\x16"
+    assert p.pack_set_debug_screen_req() == b"\x17"
+    assert p.pack_read_user_keyboard_req(250) == b"\x18\xfa\x00"
+    assert p.parse_read_user_keyboard_ret(b"A") == 0x41
+    assert p.pack_get_lib_name_req(0x1234) == b"\x19\x34\x12\x00\x00"
+    assert p.parse_get_lib_name_ret(b"\x78\x56\x00\x00watcom.dll\x00") == p.LibNameResult(
+        mod_handle=0x5678, name="watcom.dll"
+    )
+    assert p.pack_redirect_stdin_req("input.txt") == b"\x1cinput.txt\x00"
+    assert p.pack_redirect_stdout_req("output.txt") == b"\x1doutput.txt\x00"
+    assert p.parse_redirect_stdio_ret(b"\x05\x00\x00\x00") == 5
+    assert p.pack_split_cmd_req("prog arg") == b"\x1eprog arg\x00"
+    assert p.parse_split_cmd_ret(b"\x04\x00\x05\x00") == p.SplitCmdResult(4, 5)
+    assert p.pack_machine_data_req(2, Addr48(offset=0x3000, segment=0x0023), b"\xaa") == (
+        b"\x21\x02\x00\x30\x00\x00\x23\x00\xaa"
+    )
+    assert p.parse_machine_data_ret(b"\x00\x10\x00\x00\x00\x20\x00\x00\xde\xad") == (
+        p.MachineDataResult(cache_start=0x1000, cache_end=0x2000, extra=b"\xde\xad")
+    )
+
+
+@pytest.mark.parametrize(
+    ("parser", "payload", "label"),
+    [
+        (p.parse_get_supplementary_service_ret, b"\x00" * 7, "get_supplementary_service_ret"),
+        (p.parse_map_addr_ret, b"\x00" * 13, "map_addr_ret"),
+        (p.parse_checksum_mem_ret, b"\x00" * 3, "checksum_mem_ret"),
+        (p.parse_write_io_ret, b"", "write_io_ret"),
+        (p.parse_set_watch_ret, b"\x00" * 7, "set_watch_ret"),
+        (p.parse_get_next_alias_ret, b"\x00" * 3, "get_next_alias_ret"),
+        (p.parse_read_user_keyboard_ret, b"", "read_user_keyboard_ret"),
+        (p.parse_get_lib_name_ret, b"\x00" * 3, "get_lib_name_ret"),
+        (p.parse_redirect_stdio_ret, b"\x00" * 3, "redirect_stdio_ret"),
+        (p.parse_split_cmd_ret, b"\x00" * 3, "split_cmd_ret"),
+        (p.parse_machine_data_ret, b"\x00" * 7, "machine_data_ret"),
+    ],
+)
+def test_new_parsers_reject_short_replies(parser: object, payload: bytes, label: str) -> None:
+    with pytest.raises(ProtocolError, match=label):
+        parser(payload)  # type: ignore[misc]
+
+
+def test_read_io_length_validation() -> None:
+    with pytest.raises(ValueError, match="READ_IO length"):
+        p.pack_read_io_req(0x3F8, 256)
+
+
+def test_write_io_length_validation() -> None:
+    with pytest.raises(ValueError, match="WRITE_IO data length"):
+        p.pack_write_io_req(0x3F8, b"\x00" * 256)
+
+
+def test_watch_size_validation() -> None:
+    with pytest.raises(ValueError, match="watch size"):
+        p.pack_set_watch_req(Addr48(offset=0, segment=0), 3)
+    with pytest.raises(ValueError, match="watch size"):
+        p.pack_clear_watch_req(Addr48(offset=0, segment=0), 8)
+
+
 def test_decode_conditions() -> None:
     assert p.decode_conditions(Cond.BREAK | Cond.STOP) == ["BREAK", "STOP"]
     assert p.decode_conditions(0) == []

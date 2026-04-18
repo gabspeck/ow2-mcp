@@ -16,6 +16,8 @@ TRAP_VERSION_MAJOR = 18
 TRAP_VERSION_MINOR = 0
 PACKET_MAX = 0x400
 DEFAULT_PORT = 0x0DEB  # 3563
+MAP_FLAT_CODE_SELECTOR = 0xFFFF
+MAP_FLAT_DATA_SELECTOR = 0xFFFE
 
 
 class Req(IntEnum):
@@ -215,6 +217,40 @@ def pack_disconnect_req() -> bytes:
     return bytes([Req.DISCONNECT])
 
 
+# --- SUSPEND / RESUME / SUPPLEMENTARY SERVICE -------------------------------
+
+
+def pack_suspend_req() -> bytes:
+    return bytes([Req.SUSPEND])
+
+
+def pack_resume_req() -> bytes:
+    return bytes([Req.RESUME])
+
+
+def pack_get_supplementary_service_req(service: str) -> bytes:
+    return bytes([Req.GET_SUPPLEMENTARY_SERVICE]) + _latin1(service) + b"\x00"
+
+
+@dataclass(frozen=True, slots=True)
+class SupplementaryServiceResult:
+    err: int
+    shandle: int
+
+
+def parse_get_supplementary_service_ret(data: bytes) -> SupplementaryServiceResult:
+    if len(data) < 8:
+        raise _short("get_supplementary_service_ret", need=8, got=len(data))
+    err, shandle = struct.unpack_from("<II", data, 0)
+    return SupplementaryServiceResult(err=err, shandle=shandle)
+
+
+def pack_perform_supplementary_service_req(shandle: int, payload: bytes = b"") -> bytes:
+    return bytes([Req.PERFORM_SUPPLEMENTARY_SERVICE]) + struct.pack(
+        "<I", shandle & 0xFFFFFFFF
+    ) + payload
+
+
 # --- GET_SYS_CONFIG ---------------------------------------------------------
 
 
@@ -248,6 +284,39 @@ def parse_get_sys_config_ret(data: bytes) -> SysConfig:
     )
 
 
+# --- MAP_ADDR / CHECKSUM_MEM ------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class MapAddrResult:
+    out_addr: Addr48
+    lo_bound: int
+    hi_bound: int
+
+
+def pack_map_addr_req(in_addr: Addr48, mod_handle: int) -> bytes:
+    return bytes([Req.MAP_ADDR]) + in_addr.pack() + struct.pack("<I", mod_handle & 0xFFFFFFFF)
+
+
+def parse_map_addr_ret(data: bytes) -> MapAddrResult:
+    if len(data) < 14:
+        raise _short("map_addr_ret", need=14, got=len(data))
+    out_addr = Addr48.unpack(data, 0)
+    lo_bound, hi_bound = struct.unpack_from("<II", data, ADDR48_SIZE)
+    return MapAddrResult(out_addr=out_addr, lo_bound=lo_bound, hi_bound=hi_bound)
+
+
+def pack_checksum_mem_req(addr: Addr48, length: int) -> bytes:
+    return bytes([Req.CHECKSUM_MEM]) + addr.pack() + struct.pack("<H", length & 0xFFFF)
+
+
+def parse_checksum_mem_ret(data: bytes) -> int:
+    if len(data) < 4:
+        raise _short("checksum_mem_ret", need=4, got=len(data))
+    (checksum,) = struct.unpack_from("<I", data, 0)
+    return int(checksum)
+
+
 # --- READ_MEM / WRITE_MEM ---------------------------------------------------
 
 
@@ -264,6 +333,27 @@ def parse_write_mem_ret(data: bytes) -> int:
         raise _short("write_mem_ret", need=2, got=len(data))
     (written,) = struct.unpack_from("<H", data, 0)
     return int(written)
+
+
+# --- READ_IO / WRITE_IO -----------------------------------------------------
+
+
+def pack_read_io_req(io_offset: int, length: int) -> bytes:
+    if not 0 <= length <= 0xFF:
+        raise ValueError(f"READ_IO length must fit in u8, got {length}")
+    return bytes([Req.READ_IO]) + struct.pack("<IB", io_offset & 0xFFFFFFFF, length)
+
+
+def pack_write_io_req(io_offset: int, data: bytes) -> bytes:
+    if len(data) > 0xFF:
+        raise ValueError(f"WRITE_IO data length must fit in u8, got {len(data)}")
+    return bytes([Req.WRITE_IO]) + struct.pack("<I", io_offset & 0xFFFFFFFF) + data
+
+
+def parse_write_io_ret(data: bytes) -> int:
+    if len(data) < 1:
+        raise _short("write_io_ret", need=1, got=len(data))
+    return int(data[0])
 
 
 # --- READ_REGS / WRITE_REGS -------------------------------------------------
@@ -296,6 +386,37 @@ def pack_write_regs_req(data: bytes) -> bytes:
     return bytes([Req.WRITE_REGS]) + data
 
 
+# --- SET_WATCH / CLEAR_WATCH ------------------------------------------------
+
+
+def _validate_watch_size(size: int) -> None:
+    if size not in {1, 2, 4}:
+        raise ValueError(f"watch size must be one of 1, 2, 4 bytes, got {size}")
+
+
+@dataclass(frozen=True, slots=True)
+class SetWatchResult:
+    err: int
+    multiplier: int
+
+
+def pack_set_watch_req(addr: Addr48, size: int) -> bytes:
+    _validate_watch_size(size)
+    return bytes([Req.SET_WATCH]) + addr.pack() + struct.pack("<B", size)
+
+
+def parse_set_watch_ret(data: bytes) -> SetWatchResult:
+    if len(data) < 8:
+        raise _short("set_watch_ret", need=8, got=len(data))
+    err, multiplier = struct.unpack_from("<II", data, 0)
+    return SetWatchResult(err=err, multiplier=multiplier)
+
+
+def pack_clear_watch_req(addr: Addr48, size: int) -> bytes:
+    _validate_watch_size(size)
+    return bytes([Req.CLEAR_WATCH]) + addr.pack() + struct.pack("<B", size)
+
+
 # --- SET_BREAK / CLEAR_BREAK ------------------------------------------------
 
 
@@ -312,6 +433,93 @@ def parse_set_break_ret(data: bytes) -> int:
 
 def pack_clear_break_req(addr: Addr48, old: int) -> bytes:
     return struct.pack("<B", Req.CLEAR_BREAK) + addr.pack() + struct.pack("<I", old & 0xFFFFFFFF)
+
+
+# --- GET_NEXT_ALIAS / SCREEN / KEYBOARD / LIB / REDIRECT / SPLIT -----------+
+
+
+@dataclass(frozen=True, slots=True)
+class AliasResult:
+    seg: int
+    alias: int
+
+
+def pack_get_next_alias_req(seg: int) -> bytes:
+    return bytes([Req.GET_NEXT_ALIAS]) + struct.pack("<H", seg & 0xFFFF)
+
+
+def parse_get_next_alias_ret(data: bytes) -> AliasResult:
+    if len(data) < 4:
+        raise _short("get_next_alias_ret", need=4, got=len(data))
+    seg, alias = struct.unpack_from("<HH", data, 0)
+    return AliasResult(seg=seg, alias=alias)
+
+
+def pack_set_user_screen_req() -> bytes:
+    return bytes([Req.SET_USER_SCREEN])
+
+
+def pack_set_debug_screen_req() -> bytes:
+    return bytes([Req.SET_DEBUG_SCREEN])
+
+
+def pack_read_user_keyboard_req(wait_ms: int) -> bytes:
+    return bytes([Req.READ_USER_KEYBOARD]) + struct.pack("<H", wait_ms & 0xFFFF)
+
+
+def parse_read_user_keyboard_ret(data: bytes) -> int:
+    if len(data) < 1:
+        raise _short("read_user_keyboard_ret", need=1, got=len(data))
+    return int(data[0])
+
+
+@dataclass(frozen=True, slots=True)
+class LibNameResult:
+    mod_handle: int
+    name: str
+
+
+def pack_get_lib_name_req(mod_handle: int) -> bytes:
+    return bytes([Req.GET_LIB_NAME]) + struct.pack("<I", mod_handle & 0xFFFFFFFF)
+
+
+def parse_get_lib_name_ret(data: bytes) -> LibNameResult:
+    if len(data) < 4:
+        raise _short("get_lib_name_ret", need=4, got=len(data))
+    (mod_handle,) = struct.unpack_from("<I", data, 0)
+    return LibNameResult(mod_handle=mod_handle, name=_c_string(data, 4))
+
+
+def pack_redirect_stdin_req(filename: str) -> bytes:
+    return bytes([Req.REDIRECT_STDIN]) + _latin1(filename) + b"\x00"
+
+
+def pack_redirect_stdout_req(filename: str) -> bytes:
+    return bytes([Req.REDIRECT_STDOUT]) + _latin1(filename) + b"\x00"
+
+
+def parse_redirect_stdio_ret(data: bytes) -> int:
+    if len(data) < 4:
+        raise _short("redirect_stdio_ret", need=4, got=len(data))
+    (err,) = struct.unpack_from("<I", data, 0)
+    return int(err)
+
+
+@dataclass(frozen=True, slots=True)
+class SplitCmdResult:
+    cmd_end: int
+    parm_start: int
+
+
+def pack_split_cmd_req(command: str) -> bytes:
+    return bytes([Req.SPLIT_CMD]) + _latin1(command) + b"\x00"
+
+
+def parse_split_cmd_ret(data: bytes) -> SplitCmdResult:
+    if len(data) < 4:
+        raise _short("split_cmd_ret", need=4, got=len(data))
+    cmd_end, parm_start = struct.unpack_from("<HH", data, 0)
+    return SplitCmdResult(cmd_end=cmd_end, parm_start=parm_start)
 
 
 # --- PROG_GO / PROG_STEP ----------------------------------------------------
@@ -411,6 +619,27 @@ def parse_get_message_text_ret(data: bytes) -> MessageText:
     if len(data) < 1:
         raise _short("get_message_text_ret", need=1, got=len(data))
     return MessageText(flags=data[0], text=_c_string(data, 1))
+
+
+# --- MACHINE_DATA -----------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class MachineDataResult:
+    cache_start: int
+    cache_end: int
+    extra: bytes
+
+
+def pack_machine_data_req(info_type: int, addr: Addr48, extra: bytes = b"") -> bytes:
+    return bytes([Req.MACHINE_DATA, info_type & 0xFF]) + addr.pack() + extra
+
+
+def parse_machine_data_ret(data: bytes) -> MachineDataResult:
+    if len(data) < 8:
+        raise _short("machine_data_ret", need=8, got=len(data))
+    cache_start, cache_end = struct.unpack_from("<II", data, 0)
+    return MachineDataResult(cache_start=cache_start, cache_end=cache_end, extra=data[8:])
 
 
 # --- error helpers ---------------------------------------------------------

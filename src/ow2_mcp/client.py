@@ -16,12 +16,21 @@ from .errors import (
 )
 from .protocol import (
     Addr48,
+    AliasResult,
+    LibNameResult,
+    MachineDataResult,
+    MapAddrResult,
     MessageText,
     ProgGoResult,
     ProgLoadResult,
+    SetWatchResult,
+    SplitCmdResult,
+    SupplementaryServiceResult,
     SysConfig,
 )
 from .wire import PacketChannel, open_channel
+
+MapAddrSpace = str
 
 
 @dataclass(slots=True)
@@ -37,6 +46,22 @@ class ConnectResult:
     max_msg_size: int
     server_reported_max: int
     endpoint: str
+
+
+async def send_interrupt(
+    host: str,
+    port: int = p.DEFAULT_PORT,
+    *,
+    resume: bool = False,
+    timeout: float = 5.0,
+) -> None:
+    """Send REQ_SUSPEND or REQ_RESUME on a fresh one-shot TCP connection."""
+    channel = await open_channel(host, port, timeout=timeout)
+    try:
+        payload = p.pack_resume_req() if resume else p.pack_suspend_req()
+        await channel.send_packet(payload)
+    finally:
+        await channel.close()
 
 
 class TrapClient:
@@ -170,6 +195,10 @@ class TrapClient:
         reply = await self._rpc(p.pack_get_sys_config_req())
         return p.parse_get_sys_config_ret(reply)
 
+    async def get_supplementary_service(self, service: str) -> SupplementaryServiceResult:
+        reply = await self._rpc(p.pack_get_supplementary_service_req(service))
+        return p.parse_get_supplementary_service_ret(reply)
+
     async def _resolve_flat_segment(self, segment: int) -> int:
         """Return ``segment`` unchanged unless it's 0 — then return the cached
         flat DS (x86/Win32). Lazy-triggers ``read_regs`` on first use.
@@ -184,6 +213,52 @@ class TrapClient:
             # Populates both _flat_ds and _flat_cs via extract_x86_flat_selectors.
             await self.read_regs()
         return self._flat_ds if self._flat_ds is not None else 0
+
+    def _map_addr_selector(self, segment: int, space: MapAddrSpace) -> int:
+        if space == "segmented":
+            return segment
+        if space == "flat_code":
+            return p.MAP_FLAT_CODE_SELECTOR
+        if space == "flat_data":
+            return p.MAP_FLAT_DATA_SELECTOR
+        raise ValueError(
+            f"invalid MAP_ADDR space {space!r}; expected segmented, flat_code, or flat_data"
+        )
+
+    async def map_addr(
+        self,
+        offset: int,
+        segment: int = 0,
+        mod_handle: int = 0,
+        *,
+        space: MapAddrSpace = "segmented",
+    ) -> MapAddrResult:
+        req_segment = self._map_addr_selector(segment, space)
+        reply = await self._rpc(
+            p.pack_map_addr_req(Addr48(offset=offset, segment=req_segment), mod_handle)
+        )
+        try:
+            return p.parse_map_addr_ret(reply)
+        except ProtocolError as exc:
+            if (
+                not reply
+                and space == "segmented"
+                and segment == 0
+                and self._loaded is not None
+                and (self._loaded.flags & p.LoadFlag.IGNORE_SEGMENTS)
+            ):
+                raise ProtocolError(
+                    "map_addr_ret: empty reply for segmented address 0 on a flat target; "
+                    "use space='flat_code' or space='flat_data'"
+                ) from exc
+            raise
+
+    async def checksum_mem(self, offset: int, length: int, segment: int = 0) -> int:
+        segment = await self._resolve_flat_segment(segment)
+        reply = await self._rpc(
+            p.pack_checksum_mem_req(Addr48(offset=offset, segment=segment), length)
+        )
+        return p.parse_checksum_mem_ret(reply)
 
     async def read_mem(self, offset: int, length: int, segment: int = 0) -> bytes:
         if length < 0:
@@ -234,6 +309,14 @@ class TrapClient:
                 break
         return written
 
+    async def read_io(self, io_offset: int, length: int) -> bytes:
+        reply = await self._rpc(p.pack_read_io_req(io_offset, length))
+        return reply
+
+    async def write_io(self, io_offset: int, data: bytes) -> int:
+        reply = await self._rpc(p.pack_write_io_req(io_offset, data))
+        return p.parse_write_io_ret(reply)
+
     async def read_regs(self) -> bytes:
         reply = await self._rpc(p.pack_read_regs_req())
         self._reg_size = len(reply)
@@ -256,8 +339,17 @@ class TrapClient:
                 f"register block ({len(data)} bytes) exceeds max_msg_size-1 "
                 f"({self._max_msg_size - 1})"
             )
-        await self._rpc(p.pack_write_regs_req(data), expect_reply=False)
+        await self._rpc(p.pack_write_regs_req(data))
         return len(data)
+
+    async def set_watch(self, offset: int, size: int, segment: int = 0) -> SetWatchResult:
+        segment = await self._resolve_flat_segment(segment)
+        reply = await self._rpc(p.pack_set_watch_req(Addr48(offset=offset, segment=segment), size))
+        return p.parse_set_watch_ret(reply)
+
+    async def clear_watch(self, offset: int, size: int, segment: int = 0) -> None:
+        segment = await self._resolve_flat_segment(segment)
+        await self._rpc(p.pack_clear_watch_req(Addr48(offset=offset, segment=segment), size))
 
     async def set_break(self, offset: int, segment: int = 0) -> int:
         segment = await self._resolve_flat_segment(segment)
@@ -266,10 +358,37 @@ class TrapClient:
 
     async def clear_break(self, offset: int, old: int, segment: int = 0) -> None:
         segment = await self._resolve_flat_segment(segment)
-        await self._rpc(
-            p.pack_clear_break_req(Addr48(offset=offset, segment=segment), old),
-            expect_reply=False,
-        )
+        await self._rpc(p.pack_clear_break_req(Addr48(offset=offset, segment=segment), old))
+
+    async def get_next_alias(self, seg: int) -> AliasResult:
+        reply = await self._rpc(p.pack_get_next_alias_req(seg))
+        return p.parse_get_next_alias_ret(reply)
+
+    async def set_user_screen(self) -> None:
+        await self._rpc(p.pack_set_user_screen_req())
+
+    async def set_debug_screen(self) -> None:
+        await self._rpc(p.pack_set_debug_screen_req())
+
+    async def read_user_keyboard(self, wait_ms: int = 0) -> int:
+        reply = await self._rpc(p.pack_read_user_keyboard_req(wait_ms))
+        return p.parse_read_user_keyboard_ret(reply)
+
+    async def get_lib_name(self, mod_handle: int) -> LibNameResult:
+        reply = await self._rpc(p.pack_get_lib_name_req(mod_handle))
+        return p.parse_get_lib_name_ret(reply)
+
+    async def redirect_stdin(self, filename: str) -> int:
+        reply = await self._rpc(p.pack_redirect_stdin_req(filename))
+        return p.parse_redirect_stdio_ret(reply)
+
+    async def redirect_stdout(self, filename: str) -> int:
+        reply = await self._rpc(p.pack_redirect_stdout_req(filename))
+        return p.parse_redirect_stdio_ret(reply)
+
+    async def split_cmd(self, command: str) -> SplitCmdResult:
+        reply = await self._rpc(p.pack_split_cmd_req(command))
+        return p.parse_split_cmd_ret(reply)
 
     async def prog_go(self) -> ProgGoResult:
         reply = await self._rpc(p.pack_prog_go_req())
@@ -325,3 +444,16 @@ class TrapClient:
     async def get_message_text(self) -> MessageText:
         reply = await self._rpc(p.pack_get_message_text_req())
         return p.parse_get_message_text_ret(reply)
+
+    async def machine_data(
+        self,
+        info_type: int,
+        offset: int,
+        segment: int = 0,
+        extra: bytes = b"",
+    ) -> MachineDataResult:
+        segment = await self._resolve_flat_segment(segment)
+        reply = await self._rpc(
+            p.pack_machine_data_req(info_type, Addr48(offset=offset, segment=segment), extra)
+        )
+        return p.parse_machine_data_ret(reply)

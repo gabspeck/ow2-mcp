@@ -1,4 +1,4 @@
-"""FastMCP server exposing 15 TRAP tools over stdio."""
+"""FastMCP server exposing 33 core TRAP tools over stdio."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from . import protocol as p
-from .client import TrapClient
+from .client import TrapClient, send_interrupt
 from .errors import (
     AlreadyConnectedError,
     NotConnectedError,
@@ -88,6 +88,31 @@ async def trap_disconnect() -> dict[str, Any]:
 
 
 @mcp.tool()
+async def trap_suspend(host: str, port: int = p.DEFAULT_PORT) -> dict[str, Any]:
+    """Sends REQ_SUSPEND on a fresh TCP connection.
+
+    The server closes its current session on receipt, so any in-flight
+    ``trap_prog_go`` will raise ``TransportError`` and the MCP side must call
+    ``trap_connect(force=True)`` before issuing more stateful requests.
+    """
+    try:
+        await send_interrupt(host, port, resume=False)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_resume(host: str, port: int = p.DEFAULT_PORT) -> dict[str, Any]:
+    """Sends REQ_RESUME on a fresh TCP connection to continue a suspended session."""
+    try:
+        await send_interrupt(host, port, resume=True)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
 async def trap_get_sys_config() -> dict[str, Any]:
     """Query the debug server's target machine description."""
     try:
@@ -105,6 +130,63 @@ async def trap_get_sys_config() -> dict[str, Any]:
         "arch": p.arch_name(cfg.arch),
         "arch_code": cfg.arch,
         "huge_shift": cfg.huge_shift,
+    }
+
+
+@mcp.tool()
+async def trap_get_supplementary_service(service: str) -> dict[str, Any]:
+    """Resolve a supplementary-service name to its server handle."""
+    try:
+        result = await _client.get_supplementary_service(service)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "err": result.err, "shandle": result.shandle}
+
+
+@mcp.tool()
+async def trap_map_addr(
+    offset: int,
+    segment: int = 0,
+    mod_handle: int = 0,
+    space: str = "segmented",
+) -> dict[str, Any]:
+    """Map an address through the server's loader relocation tables.
+
+    Use ``space='segmented'`` for literal ``segment:offset`` input.
+    Use ``space='flat_code'`` or ``space='flat_data'`` for flat Win32
+    addresses; those map to Open Watcom's special flat selectors.
+    """
+    try:
+        result = await _client.map_addr(offset, segment, mod_handle=mod_handle, space=space)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "out_addr": {"segment": result.out_addr.segment, "offset": result.out_addr.offset},
+        "lo_bound": result.lo_bound,
+        "hi_bound": result.hi_bound,
+        "space": space,
+    }
+
+
+@mcp.tool()
+async def trap_checksum_mem(offset: int, length: int, segment: int = 0) -> dict[str, Any]:
+    """Checksum ``length`` bytes starting at ``segment:offset``.
+
+    On Win32/x86, ``segment=0`` means "flat mode" and is substituted with the
+    live DS selector before the request is sent.
+    """
+    try:
+        checksum = await _client.checksum_mem(offset, length, segment=segment)
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "checksum": checksum,
+        "checksum_hex": f"0x{checksum:08x}",
+        "flat_segment_used": _client.flat_ds if segment == 0 else segment,
     }
 
 
@@ -152,6 +234,39 @@ async def trap_write_mem(offset: int, data: str, segment: int = 0) -> dict[str, 
 
 
 @mcp.tool()
+async def trap_read_io(io_offset: int, length: int) -> dict[str, Any]:
+    """Read up to 255 bytes from an I/O port or bus offset.
+
+    The request length is a u8 on the wire, so values above 255 are rejected.
+    Typical use is x86 port I/O.
+    """
+    try:
+        data = await _client.read_io(io_offset, length)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "data": data.hex(), "read_length": len(data)}
+
+
+@mcp.tool()
+async def trap_write_io(io_offset: int, data: str) -> dict[str, Any]:
+    """Write hex-encoded bytes to an I/O port or bus offset.
+
+    ``data`` accepts ``0x`` prefixes and whitespace/underscore separators. The
+    payload length is limited to 255 bytes by the TRAP wire format.
+    """
+    try:
+        raw = _unhex(data)
+        written = await _client.write_io(io_offset, raw)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "written": written, "requested": len(raw)}
+
+
+@mcp.tool()
 async def trap_read_regs() -> dict[str, Any]:
     """Read the full register block. The size is target-specific and used to
     validate subsequent :func:`trap_write_regs` calls."""
@@ -175,6 +290,42 @@ async def trap_write_regs(data: str) -> dict[str, Any]:
     except TrapError as exc:
         return _err(exc)
     return {"ok": True, "written": written}
+
+
+@mcp.tool()
+async def trap_set_watch(offset: int, size: int, segment: int = 0) -> dict[str, Any]:
+    """Set a watchpoint of size 1, 2, or 4 bytes at ``segment:offset``.
+
+    On Win32/x86, ``segment=0`` means "flat mode" and is substituted with the
+    live DS selector before the request is sent.
+    """
+    try:
+        result = await _client.set_watch(offset, size, segment=segment)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "err": result.err,
+        "multiplier": result.multiplier,
+        "flat_segment_used": _client.flat_ds if segment == 0 else segment,
+    }
+
+
+@mcp.tool()
+async def trap_clear_watch(offset: int, size: int, segment: int = 0) -> dict[str, Any]:
+    """Clear a watchpoint of size 1, 2, or 4 bytes at ``segment:offset``."""
+    try:
+        await _client.clear_watch(offset, size, segment=segment)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "flat_segment_used": _client.flat_ds if segment == 0 else segment,
+    }
 
 
 @mcp.tool()
@@ -210,6 +361,90 @@ async def trap_clear_break(offset: int, old: int, segment: int = 0) -> dict[str,
         "ok": True,
         "flat_segment_used": _client.flat_ds if segment == 0 else segment,
     }
+
+
+@mcp.tool()
+async def trap_get_next_alias(seg: int) -> dict[str, Any]:
+    """Query the next alias mapping for ``seg`` in a segmented target."""
+    try:
+        result = await _client.get_next_alias(seg)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "seg": result.seg, "alias": result.alias}
+
+
+@mcp.tool()
+async def trap_set_user_screen() -> dict[str, Any]:
+    """Switch the target display back to the user screen."""
+    try:
+        await _client.set_user_screen()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_set_debug_screen() -> dict[str, Any]:
+    """Switch the target display to the debugger screen."""
+    try:
+        await _client.set_debug_screen()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_read_user_keyboard(wait_ms: int = 0) -> dict[str, Any]:
+    """Poll the user's keyboard with an optional wait timeout in milliseconds."""
+    try:
+        key = await _client.read_user_keyboard(wait_ms=wait_ms)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "key": key, "key_hex": f"0x{key:02x}"}
+
+
+@mcp.tool()
+async def trap_get_lib_name(mod_handle: int) -> dict[str, Any]:
+    """Enumerate loaded modules.
+
+    Pass ``mod_handle=0`` to start. The returned ``next_mod_handle`` is the
+    handle to pass on the next call; an empty ``name`` marks the end of the list.
+    """
+    try:
+        result = await _client.get_lib_name(mod_handle)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "next_mod_handle": result.mod_handle, "name": result.name}
+
+
+@mcp.tool()
+async def trap_redirect_stdin(filename: str) -> dict[str, Any]:
+    """Redirect stdin to a server-side file path and return the TRAP error code."""
+    try:
+        err = await _client.redirect_stdin(filename)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "err": err}
+
+
+@mcp.tool()
+async def trap_redirect_stdout(filename: str) -> dict[str, Any]:
+    """Redirect stdout to a server-side file path and return the TRAP error code."""
+    try:
+        err = await _client.redirect_stdout(filename)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "err": err}
+
+
+@mcp.tool()
+async def trap_split_cmd(command: str) -> dict[str, Any]:
+    """Split a command line into program and parameter spans using the trap server."""
+    try:
+        result = await _client.split_cmd(command)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "cmd_end": result.cmd_end, "parm_start": result.parm_start}
 
 
 def _go_result(result: Any) -> dict[str, Any]:
@@ -301,4 +536,34 @@ async def trap_get_message_text() -> dict[str, Any]:
         "flags": msg.flags,
         "flag_names": p.decode_msg_flags(msg.flags),
         "text": msg.text,
+    }
+
+
+@mcp.tool()
+async def trap_machine_data(
+    info_type: int,
+    offset: int,
+    segment: int = 0,
+    extra: str = "",
+) -> dict[str, Any]:
+    """Query machine-specific metadata for ``segment:offset``.
+
+    ``extra`` is arch-specific request data encoded as hex. The reply exposes
+    ``cache_start``/``cache_end`` plus arch-specific trailing bytes in ``extra``
+    as lowercase hex; callers must decode it using the relevant MAD headers
+    such as ``madx86.h`` or ``madx64.h``.
+    """
+    try:
+        raw_extra = _unhex(extra) if extra else b""
+        result = await _client.machine_data(info_type, offset, segment=segment, extra=raw_extra)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "cache_start": result.cache_start,
+        "cache_end": result.cache_end,
+        "extra": result.extra.hex(),
+        "flat_segment_used": _client.flat_ds if segment == 0 else segment,
     }
