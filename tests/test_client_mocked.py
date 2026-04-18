@@ -646,3 +646,93 @@ async def test_machine_data_substitutes_cached_flat_ds() -> None:
         result = await client.machine_data(1, 0x4000, extra=b"\x99")
         assert result.cache_start == 0x1000
         assert result.cache_end == 0x2000
+
+
+async def test_supplementary_handle_is_cached_per_service() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (p.pack_get_supplementary_service_req(p.SUPP_FILES), b"\x00\x00\x00\x00\x44\x33\x22\x11"),
+        (p.pack_file_get_config_req(0x11223344), b".:\\/\r\n;"),
+        (
+            p.pack_file_open_req(0x11223344, 2, "config.sys"),
+            b"\x00\x00\x00\x00" + b"\x88\x77\x66\x55\x00\x00\x00\x00",
+        ),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        cfg = await client.file_get_config()
+        opened = await client.file_open(2, "config.sys")
+        assert cfg.ext_separator == "."
+        assert opened.handle == 0x55667788
+
+
+async def test_env_overlay_thread_runthread_rfx_capability_and_async_round_trip() -> None:
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (
+            p.pack_get_supplementary_service_req(p.SUPP_ENVIRONMENT),
+            b"\x00\x00\x00\x00\x10\x00\x00\x00",
+        ),
+        (
+            p.pack_env_get_var_req(0x10, 128, "PATH"),
+            b"\x00\x00\x00\x00C:\\OW2;C:\\BIN\x00",
+        ),
+        (
+            p.pack_get_supplementary_service_req(p.SUPP_OVERLAYS),
+            b"\x00\x00\x00\x00\x20\x00\x00\x00",
+        ),
+        (
+            p.pack_ovl_trans_vect_addr_req(
+                0x20, p.OvlAddress(mach=p.Addr48(offset=0x1000, segment=0x23), sect_id=7)
+            ),
+            b"\x78\x56\x34\x12\x9a\x00\x05\x00",
+        ),
+        (p.pack_get_supplementary_service_req(p.SUPP_THREADS), b"\x00\x00\x00\x00\x30\x00\x00\x00"),
+        (p.pack_thread_get_next_req(0x30, 0), b"\x34\x12\x00\x00\x01"),
+        (
+            p.pack_get_supplementary_service_req(p.SUPP_RUN_THREAD),
+            b"\x00\x00\x00\x00\x40\x00\x00\x00",
+        ),
+        (p.pack_run_thread_info_req(0x40, 1), b"\x01\x0c\x00Name\x00"),
+        (p.pack_get_supplementary_service_req(p.SUPP_RFX), b"\x00\x00\x00\x00\x50\x00\x00\x00"),
+        (
+            p.pack_rfx_findfirst_req(0x50, 0x20, "*.exe"),
+            b"\x00\x00\x00\x00"
+            + (b"\x00" * 21)
+            + b"\x20"
+            + b"\x34\x12"
+            + b"\x78\x56"
+            + b"\x10\x00\x00\x00"
+            + b"kernel.exe\x00",
+        ),
+        (
+            p.pack_get_supplementary_service_req(p.SUPP_CAPABILITIES),
+            b"\x00\x00\x00\x00\x60\x00\x00\x00",
+        ),
+        (p.pack_capabilities_get_exact_bp_req(0x60), b"\x00\x00\x00\x00\x01"),
+        (p.pack_get_supplementary_service_req(p.SUPP_ASYNCH), b"\x00\x00\x00\x00\x70\x00\x00\x00"),
+        (
+            p.pack_async_go_req(0x70),
+            b"\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x23\x00\x80\x20",
+        ),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        env = await client.env_get_var(128, "PATH")
+        ovl = await client.ovl_trans_vect_addr(
+            p.OvlAddress(mach=p.Addr48(offset=0x1000, segment=0x23), sect_id=7)
+        )
+        thread = await client.thread_get_next(0)
+        info = await client.run_thread_info(1)
+        found = await client.rfx_findfirst(0x20, "*.exe")
+        cap = await client.capabilities_get_exact_bp()
+        async_result = await client.async_go()
+        assert env.value == "C:\\OW2;C:\\BIN"
+        assert ovl.sect_id == 5
+        assert thread.state == p.ThreadState.FROZEN
+        assert info.header == "Name"
+        assert found.info is not None and found.info.name == "kernel.exe"
+        assert cap.status == 1
+        assert async_result.conditions == (p.Cond.BREAK | p.Cond.STOP)

@@ -229,6 +229,63 @@ def test_alias_screen_keyboard_lib_redirect_split_and_machine_data_round_trip() 
     )
 
 
+def test_supplementary_file_env_overlay_and_async_round_trip() -> None:
+    assert p.pack_supplementary_req(0x1234, p.FileReq.GET_CONFIG) == b"\x05\x34\x12\x00\x00\x00"
+    assert p.parse_file_get_config_ret(b".:\\/\r\n;") == p.FileComponents(
+        ".", ":", "\\/", "\r\n", ";"
+    )
+    assert p.pack_file_open_req(0x1234, 2, "autoexec.bat") == (
+        b"\x05\x34\x12\x00\x00\x01\x02autoexec.bat\x00"
+    )
+    assert p.parse_file_open_ret(b"\x00\x00\x00\x00" + b"\x78\x56\x34\x12\x00\x00\x00\x00") == (
+        p.FileOpenResult(err=0, handle=0x12345678)
+    )
+    assert p.parse_file_read_ret(b"\x00\x00\x00\x00abc") == p.FileReadResult(err=0, data=b"abc")
+    assert p.parse_env_get_var_ret(b"\x00\x00\x00\x00PATH=C:\\OW2\x00") == p.StringResult(
+        err=0, value="PATH=C:\\OW2"
+    )
+    ovl = p.OvlAddress(mach=Addr48(offset=0x1000, segment=0x23), sect_id=7)
+    assert p.pack_ovl_trans_vect_addr_req(0x55, ovl) == (
+        b"\x05\x55\x00\x00\x00\x04\x00\x10\x00\x00\x23\x00\x07\x00"
+    )
+    assert p.parse_ovl_get_remap_entry_ret(
+        b"\x01\x78\x56\x34\x12\x9a\x00\x05\x00"
+    ) == p.OvlRemapEntryResult(
+        remapped=True,
+        ovl_addr=p.OvlAddress(mach=Addr48(offset=0x12345678, segment=0x009A), sect_id=5),
+    )
+    assert p.parse_async_ret(
+        b"\x44\x33\x22\x11\x01\x00\x88\x77\x66\x55\x02\x00\x80\x20"
+    ) == p.ProgGoResult(
+        stack_pointer=Addr48(offset=0x11223344, segment=1),
+        program_counter=Addr48(offset=0x55667788, segment=2),
+        conditions=p.Cond.BREAK | p.Cond.STOP,
+    )
+
+
+def test_thread_runthread_rfx_and_capability_round_trip() -> None:
+    assert p.parse_thread_get_next_ret(b"\x34\x12\x00\x00\x01") == p.ThreadGetNextResult(
+        thread=0x1234, state=p.ThreadState.FROZEN
+    )
+    assert p.parse_run_thread_info_ret(b"\x03\x10\x00CS:EIP\x00") == p.RunThreadInfoResult(
+        info=p.RunThreadInfoType.CS_EIP, width=16, header="CS:EIP"
+    )
+    assert p.parse_run_thread_get_runtime_ret(b"\x00\x1b\x00\x78\x56\x34\x12ready\x00") == (
+        p.RunThreadRuntimeResult(state=0, cs=0x001B, eip=0x12345678, extra="ready")
+    )
+    find = p.parse_rfx_find(
+        b"\x00" * 21 + b"\x20" + b"\x34\x12" + b"\x78\x56" + b"\xef\xcd\xab\x89" + b"kernel.exe\x00"
+    )
+    assert find.attr == 0x20
+    assert find.time == 0x1234
+    assert find.date == 0x5678
+    assert find.size == 0x89ABCDEF
+    assert find.name == "kernel.exe"
+    assert p.parse_capabilities_get_exact_bp_ret(b"\x00\x00\x00\x00\x01") == (
+        p.ExactBreakpointSupport(err=0, status=1)
+    )
+
+
 @pytest.mark.parametrize(
     ("parser", "payload", "label"),
     [

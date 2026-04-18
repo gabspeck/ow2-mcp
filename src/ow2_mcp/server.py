@@ -55,6 +55,27 @@ def _unhex(text: str) -> bytes:
         raise ValueError(f"invalid hex: {exc}") from exc
 
 
+def _addr48(addr: p.Addr48) -> dict[str, int]:
+    return {"segment": addr.segment, "offset": addr.offset}
+
+
+def _ovl_addr(addr: p.OvlAddress) -> dict[str, Any]:
+    return {"mach": _addr48(addr.mach), "sect_id": addr.sect_id}
+
+
+def _rfx_find(info: p.RfxFindResult | None) -> dict[str, Any] | None:
+    if info is None:
+        return None
+    return {
+        "reserved": info.reserved.hex(),
+        "attr": info.attr,
+        "time": info.time,
+        "date": info.date,
+        "size": info.size,
+        "name": info.name,
+    }
+
+
 @mcp.tool()
 async def trap_connect(
     host: str, port: int = p.DEFAULT_PORT, force: bool = False
@@ -566,4 +587,612 @@ async def trap_machine_data(
         "cache_end": result.cache_end,
         "extra": result.extra.hex(),
         "flat_segment_used": _client.flat_ds if segment == 0 else segment,
+    }
+
+
+@mcp.tool()
+async def trap_file_get_config() -> dict[str, Any]:
+    try:
+        result = await _client.file_get_config()
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "ext_separator": result.ext_separator,
+        "drv_separator": result.drv_separator,
+        "path_separator": result.path_separator,
+        "line_eol": result.line_eol,
+        "list_separator": result.list_separator,
+    }
+
+
+@mcp.tool()
+async def trap_file_open(mode: int, name: str) -> dict[str, Any]:
+    try:
+        result = await _client.file_open(mode, name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "handle": result.handle}
+
+
+@mcp.tool()
+async def trap_file_seek(handle: int, mode: int, pos: int) -> dict[str, Any]:
+    try:
+        result = await _client.file_seek(handle, mode, pos)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "pos": result.pos}
+
+
+@mcp.tool()
+async def trap_file_read(handle: int, length: int) -> dict[str, Any]:
+    try:
+        result = await _client.file_read(handle, length)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "data": result.data.hex(), "read_length": len(result.data)}
+
+
+@mcp.tool()
+async def trap_file_write(handle: int, data: str) -> dict[str, Any]:
+    try:
+        raw = _unhex(data)
+        result = await _client.file_write(handle, raw)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "written": result.length, "requested": len(raw)}
+
+
+@mcp.tool()
+async def trap_file_write_console(data: str) -> dict[str, Any]:
+    try:
+        raw = _unhex(data)
+        result = await _client.file_write_console(raw)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "written": result.length, "requested": len(raw)}
+
+
+@mcp.tool()
+async def trap_file_close(handle: int) -> dict[str, Any]:
+    try:
+        await _client.file_close(handle)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_file_erase(name: str) -> dict[str, Any]:
+    try:
+        await _client.file_erase(name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_file_string_to_fullpath(file_type: int, name: str) -> dict[str, Any]:
+    try:
+        result = await _client.file_string_to_fullpath(file_type, name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "value": result.value}
+
+
+@mcp.tool()
+async def trap_file_run_cmd(command: str, chk_size: int = 0) -> dict[str, Any]:
+    try:
+        await _client.file_run_cmd(chk_size, command)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_file_info_get_date(name: str) -> dict[str, Any]:
+    try:
+        result = await _client.file_info_get_date(name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "date": result.date}
+
+
+@mcp.tool()
+async def trap_file_info_set_date(name: str, date: int) -> dict[str, Any]:
+    try:
+        await _client.file_info_set_date(date, name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_env_get_var(name: str, res_len: int = 4096) -> dict[str, Any]:
+    try:
+        result = await _client.env_get_var(res_len, name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "value": result.value}
+
+
+@mcp.tool()
+async def trap_env_set_var(name: str, value: str) -> dict[str, Any]:
+    try:
+        await _client.env_set_var(name, value)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_ovl_state_size() -> dict[str, Any]:
+    try:
+        size = await _client.ovl_state_size()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "size": size}
+
+
+@mcp.tool()
+async def trap_ovl_get_data(sect_id: int) -> dict[str, Any]:
+    try:
+        result = await _client.ovl_get_data(sect_id)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "segment": result.segment, "size": result.size}
+
+
+@mcp.tool()
+async def trap_ovl_read_state() -> dict[str, Any]:
+    try:
+        data = await _client.ovl_read_state()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "data": data.hex(), "length": len(data)}
+
+
+@mcp.tool()
+async def trap_ovl_write_state(data: str) -> dict[str, Any]:
+    try:
+        await _client.ovl_write_state(_unhex(data))
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_ovl_trans_vect_addr(offset: int, segment: int, sect_id: int) -> dict[str, Any]:
+    try:
+        result = await _client.ovl_trans_vect_addr(
+            p.OvlAddress(mach=p.Addr48(offset=offset, segment=segment), sect_id=sect_id)
+        )
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "ovl_addr": _ovl_addr(result)}
+
+
+@mcp.tool()
+async def trap_ovl_trans_ret_addr(offset: int, segment: int, sect_id: int) -> dict[str, Any]:
+    try:
+        result = await _client.ovl_trans_ret_addr(
+            p.OvlAddress(mach=p.Addr48(offset=offset, segment=segment), sect_id=sect_id)
+        )
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "ovl_addr": _ovl_addr(result)}
+
+
+@mcp.tool()
+async def trap_ovl_get_remap_entry(offset: int, segment: int, sect_id: int) -> dict[str, Any]:
+    try:
+        result = await _client.ovl_get_remap_entry(
+            p.OvlAddress(mach=p.Addr48(offset=offset, segment=segment), sect_id=sect_id)
+        )
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "remapped": result.remapped, "ovl_addr": _ovl_addr(result.ovl_addr)}
+
+
+@mcp.tool()
+async def trap_thread_get_next(thread: int = 0) -> dict[str, Any]:
+    try:
+        result = await _client.thread_get_next(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "thread": result.thread,
+        "state": result.state,
+        "state_name": p.decode_thread_state(result.state),
+    }
+
+
+@mcp.tool()
+async def trap_thread_set(thread: int) -> dict[str, Any]:
+    try:
+        result = await _client.thread_set(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "old_thread": result.old_thread}
+
+
+@mcp.tool()
+async def trap_thread_freeze(thread: int) -> dict[str, Any]:
+    try:
+        await _client.thread_freeze(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_thread_thaw(thread: int) -> dict[str, Any]:
+    try:
+        await _client.thread_thaw(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_thread_get_extra(thread: int) -> dict[str, Any]:
+    try:
+        extra = await _client.thread_get_extra(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "extra": extra}
+
+
+@mcp.tool()
+async def trap_run_thread_info(col: int) -> dict[str, Any]:
+    try:
+        result = await _client.run_thread_info(col)
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "info": result.info,
+        "info_name": p.decode_run_thread_info_type(result.info),
+        "width": result.width,
+        "header": result.header,
+    }
+
+
+@mcp.tool()
+async def trap_run_thread_get_next(thread: int = 0) -> dict[str, Any]:
+    try:
+        result = await _client.run_thread_get_next(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "thread": result.thread}
+
+
+@mcp.tool()
+async def trap_run_thread_get_runtime(thread: int) -> dict[str, Any]:
+    try:
+        result = await _client.run_thread_get_runtime(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "state": result.state,
+        "state_name": p.decode_thread_state(result.state),
+        "cs": result.cs,
+        "eip": result.eip,
+        "extra": result.extra,
+    }
+
+
+@mcp.tool()
+async def trap_run_thread_poll() -> dict[str, Any]:
+    try:
+        conditions = await _client.run_thread_poll()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "conditions_raw": conditions, "conditions": p.decode_conditions(conditions)}
+
+
+@mcp.tool()
+async def trap_run_thread_set(thread: int) -> dict[str, Any]:
+    try:
+        result = await _client.run_thread_set(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "old_thread": result.old_thread}
+
+
+@mcp.tool()
+async def trap_run_thread_get_name(thread: int) -> dict[str, Any]:
+    try:
+        name = await _client.run_thread_get_name(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "name": name}
+
+
+@mcp.tool()
+async def trap_run_thread_stop(thread: int) -> dict[str, Any]:
+    try:
+        await _client.run_thread_stop(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_run_thread_signal_stop(thread: int) -> dict[str, Any]:
+    try:
+        await _client.run_thread_signal_stop(thread)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_rename(old_name: str, new_name: str) -> dict[str, Any]:
+    try:
+        await _client.rfx_rename(old_name, new_name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_mkdir(dirname: str) -> dict[str, Any]:
+    try:
+        await _client.rfx_mkdir(dirname)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_rmdir(dirname: str) -> dict[str, Any]:
+    try:
+        await _client.rfx_rmdir(dirname)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_setdrive(drive: int) -> dict[str, Any]:
+    try:
+        await _client.rfx_setdrive(drive)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_getdrive() -> dict[str, Any]:
+    try:
+        drive = await _client.rfx_getdrive()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "drive": drive}
+
+
+@mcp.tool()
+async def trap_rfx_setcwd(cwd: str) -> dict[str, Any]:
+    try:
+        await _client.rfx_setcwd(cwd)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_getcwd(drive: int = 0) -> dict[str, Any]:
+    try:
+        result = await _client.rfx_getcwd(drive)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "cwd": result.value}
+
+
+@mcp.tool()
+async def trap_rfx_setdatetime(handle: int, time: int) -> dict[str, Any]:
+    try:
+        await _client.rfx_setdatetime(handle, time)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_getdatetime(handle: int) -> dict[str, Any]:
+    try:
+        time = await _client.rfx_getdatetime(handle)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "time": time}
+
+
+@mcp.tool()
+async def trap_rfx_getfreespace(drive: int = 0) -> dict[str, Any]:
+    try:
+        size = await _client.rfx_getfreespace(drive)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "size": size}
+
+
+@mcp.tool()
+async def trap_rfx_setfileattr(attribute: int, name: str) -> dict[str, Any]:
+    try:
+        await _client.rfx_setfileattr(attribute, name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_rfx_getfileattr(name: str) -> dict[str, Any]:
+    try:
+        attribute = await _client.rfx_getfileattr(name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "attribute": attribute}
+
+
+@mcp.tool()
+async def trap_rfx_nametocanonical(name: str) -> dict[str, Any]:
+    try:
+        result = await _client.rfx_nametocanonical(name)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "value": result.value}
+
+
+@mcp.tool()
+async def trap_rfx_findfirst(attrib: int, pattern: str) -> dict[str, Any]:
+    try:
+        result = await _client.rfx_findfirst(attrib, pattern)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "find": _rfx_find(result.info)}
+
+
+@mcp.tool()
+async def trap_rfx_findnext(
+    reserved: str,
+    attr: int,
+    time: int,
+    date: int,
+    size: int,
+    name: str,
+) -> dict[str, Any]:
+    try:
+        info = p.RfxFindResult(
+            reserved=_unhex(reserved),
+            attr=attr,
+            time=time,
+            date=date,
+            size=size,
+            name=name,
+        )
+        result = await _client.rfx_findnext(info)
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "find": _rfx_find(result.info)}
+
+
+@mcp.tool()
+async def trap_rfx_findclose(
+    reserved: str,
+    attr: int,
+    time: int,
+    date: int,
+    size: int,
+    name: str,
+) -> dict[str, Any]:
+    try:
+        await _client.rfx_findclose(
+            p.RfxFindResult(
+                reserved=_unhex(reserved),
+                attr=attr,
+                time=time,
+                date=date,
+                size=size,
+                name=name,
+            )
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True}
+
+
+@mcp.tool()
+async def trap_capabilities_get_exact_bp() -> dict[str, Any]:
+    try:
+        result = await _client.capabilities_get_exact_bp()
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "status": result.status, "enabled": bool(result.status)}
+
+
+@mcp.tool()
+async def trap_capabilities_set_exact_bp(status: int) -> dict[str, Any]:
+    try:
+        result = await _client.capabilities_set_exact_bp(status)
+    except TrapError as exc:
+        return _err(exc)
+    return {"ok": True, "status": result.status, "enabled": bool(result.status)}
+
+
+@mcp.tool()
+async def trap_async_go() -> dict[str, Any]:
+    try:
+        result = await _client.async_go()
+    except TrapError as exc:
+        return _err(exc)
+    return _go_result(result)
+
+
+@mcp.tool()
+async def trap_async_step() -> dict[str, Any]:
+    try:
+        result = await _client.async_step()
+    except TrapError as exc:
+        return _err(exc)
+    return _go_result(result)
+
+
+@mcp.tool()
+async def trap_async_poll() -> dict[str, Any]:
+    try:
+        result = await _client.async_poll()
+    except TrapError as exc:
+        return _err(exc)
+    return _go_result(result)
+
+
+@mcp.tool()
+async def trap_async_stop() -> dict[str, Any]:
+    try:
+        result = await _client.async_stop()
+    except TrapError as exc:
+        return _err(exc)
+    return _go_result(result)
+
+
+@mcp.tool()
+async def trap_async_add_break(
+    offset: int, segment: int = 0, local: bool = False
+) -> dict[str, Any]:
+    try:
+        await _client.async_add_break(offset, segment=segment, local=local)
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "flat_segment_used": _client.flat_ds if segment == 0 else segment,
+        "local": local,
+    }
+
+
+@mcp.tool()
+async def trap_async_remove_break(
+    offset: int, segment: int = 0, local: bool = False
+) -> dict[str, Any]:
+    try:
+        await _client.async_remove_break(offset, segment=segment, local=local)
+    except TrapError as exc:
+        return _err(exc)
+    return {
+        "ok": True,
+        "flat_segment_used": _client.flat_ds if segment == 0 else segment,
+        "local": local,
     }
