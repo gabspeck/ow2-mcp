@@ -48,7 +48,7 @@ async def test_flat_read_mem_at_eip_returns_bytes() -> None:
                 f"flat-mode fix only applies to x86/Win32 "
                 f"(got arch={cfg.arch}, os={cfg.os})"
             )
-        load = await client.prog_load("C:\\WINDOWS\\NOTEPAD.EXE")
+        load = await client.prog_load(["C:\\WINDOWS\\NOTEPAD.EXE"])
         assert load.err == 0, f"prog_load failed: err={load.err}"
         try:
             regs = await client.read_regs()

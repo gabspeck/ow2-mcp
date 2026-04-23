@@ -15,6 +15,7 @@ from ow2_mcp.errors import (
     AlreadyConnectedError,
     NotConnectedError,
     ProtocolError,
+    TransportError,
     TrapServerError,
 )
 from ow2_mcp.protocol import PACKET_MAX, Req
@@ -34,6 +35,24 @@ async def _write_packet(writer: asyncio.StreamWriter, payload: bytes) -> None:
 
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], "asyncio.Future[None] | object"]
+
+
+class _DisconnectChannel:
+    def __init__(self, peer_closed: bool) -> None:
+        self.peer_closed = peer_closed
+        self.sent: list[bytes] = []
+        self.waits: list[float] = []
+        self.closed_abortive: bool | None = None
+
+    async def send_packet(self, payload: bytes) -> None:
+        self.sent.append(payload)
+
+    async def wait_peer_close(self, timeout: float) -> bool:
+        self.waits.append(timeout)
+        return self.peer_closed
+
+    async def close(self, *, abortive: bool = False) -> None:
+        self.closed_abortive = abortive
 
 
 @asynccontextmanager
@@ -102,6 +121,32 @@ async def test_connect_success_and_disconnect() -> None:
         assert not client.connected
 
 
+async def test_disconnect_uses_normal_close_when_server_closes_after_disconnect() -> None:
+    client = TrapClient()
+    channel = _DisconnectChannel(peer_closed=True)
+    client._channel = channel  # type: ignore[assignment]
+
+    await client.disconnect()
+
+    assert channel.sent == [p.pack_disconnect_req()]
+    assert channel.waits
+    assert channel.closed_abortive is False
+    assert not client.connected
+
+
+async def test_disconnect_falls_back_to_abortive_close_when_server_stays_open() -> None:
+    client = TrapClient()
+    channel = _DisconnectChannel(peer_closed=False)
+    client._channel = channel  # type: ignore[assignment]
+
+    await client.disconnect()
+
+    assert channel.sent == [p.pack_disconnect_req()]
+    assert channel.waits
+    assert channel.closed_abortive is True
+    assert not client.connected
+
+
 async def test_connect_clamps_server_reported_max() -> None:
     # Some local traps return 0xFFFF — we must clamp to PACKET_MAX.
     script = [(b"\x00\x12\x00\x00", b"\xff\xff\x00")]
@@ -148,8 +193,6 @@ async def test_teardown_on_socket_drop() -> None:
     async with _server(_scripted(script)) as (host, port):
         client = TrapClient()
         await client.connect(host, port)
-        from ow2_mcp.errors import TransportError
-
         with pytest.raises(TransportError):
             await client.get_sys_config()
         assert not client.connected
@@ -273,7 +316,7 @@ async def test_prog_load_stores_task_id_and_kill_defaults_to_it() -> None:
     async with _server(_scripted(script)) as (host, port):
         client = TrapClient()
         await client.connect(host, port)
-        result = await client.prog_load("hello")
+        result = await client.prog_load(["hello"])
         assert result.task_id == 0xABCD
         assert result.mod_handle == 0x1234
         assert client.loaded is not None
@@ -281,6 +324,36 @@ async def test_prog_load_stores_task_id_and_kill_defaults_to_it() -> None:
         err = await client.prog_kill()
         assert err == 0
         assert client.loaded is None
+
+
+async def test_prog_load_true_argv_sends_multi_string_payload() -> None:
+    load_reply = b"\x00\x00\x00\x00" + b"\x78\x56\x00\x00" + b"\x34\x12\x00\x00" + b"\x00"
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (b"\x0f\x01hello\x00a\x00b\x00", load_reply),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.prog_load(["hello", "a", "b"], true_argv=True)
+        assert result.task_id == 0x5678
+        assert client.loaded is not None
+        assert client.loaded.program == "hello"
+
+
+async def test_prog_attach_encodes_uppercase_hex_token() -> None:
+    load_reply = b"\x00\x00\x00\x00" + b"\x78\x56\x34\x12" + b"\x00\x00\x00\x00" + b"\x00"
+    script = [
+        (b"\x00\x12\x00\x00", b"\x00\x04\x00"),
+        (b"\x0f\x00#FFF09CBF\x00\x00", load_reply),
+    ]
+    async with _server(_scripted(script)) as (host, port):
+        client = TrapClient()
+        await client.connect(host, port)
+        result = await client.prog_attach(0xFFF09CBF)
+        assert result.task_id == 0x12345678
+        assert client.loaded is not None
+        assert client.loaded.program == "#FFF09CBF"
 
 
 async def test_set_break_returns_old_and_clear_break_echoes_it() -> None:
@@ -313,6 +386,59 @@ async def test_prog_go_decodes_conditions() -> None:
         result = await client.prog_go()
         assert result.program_counter.offset == 0x1000
         assert result.conditions == (p.Cond.BREAK | p.Cond.STOP)
+
+
+async def test_non_run_rpc_timeout_raises_transport_error_and_tears_down() -> None:
+    async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        assert await _read_packet(reader) == b"\x00\x12\x00\x00"
+        await _write_packet(writer, b"\x00\x04\x00")
+        assert await _read_packet(reader) == bytes([Req.GET_SYS_CONFIG])
+        await asyncio.sleep(0.2)
+
+    async with _server(_handler) as (host, port):
+        client = TrapClient(recv_timeout=0.05)
+        await client.connect(host, port)
+        with pytest.raises(TransportError, match="recv timed out"):
+            await client.get_sys_config()
+        assert not client.connected
+
+
+async def test_prog_go_remains_unbounded_by_default() -> None:
+    go_reply = (
+        b"\x00\x00\x00\x00\x00\x00"
+        b"\x00\x10\x00\x00\x00\x00"
+        b"\x80\x20"
+    )
+
+    async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        assert await _read_packet(reader) == b"\x00\x12\x00\x00"
+        await _write_packet(writer, b"\x00\x04\x00")
+        assert await _read_packet(reader) == bytes([Req.PROG_GO])
+        await asyncio.sleep(0.1)
+        await _write_packet(writer, go_reply)
+
+    async with _server(_handler) as (host, port):
+        client = TrapClient(recv_timeout=0.05)
+        await client.connect(host, port)
+        result = await client.prog_go()
+        assert result.program_counter.offset == 0x1000
+        assert result.conditions == (p.Cond.BREAK | p.Cond.STOP)
+        assert client.connected
+
+
+async def test_prog_go_timeout_raises_transport_error_and_tears_down() -> None:
+    async def _handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        assert await _read_packet(reader) == b"\x00\x12\x00\x00"
+        await _write_packet(writer, b"\x00\x04\x00")
+        assert await _read_packet(reader) == bytes([Req.PROG_GO])
+        await asyncio.sleep(0.2)
+
+    async with _server(_handler) as (host, port):
+        client = TrapClient(recv_timeout=0.05)
+        await client.connect(host, port)
+        with pytest.raises(TransportError, match="recv timed out"):
+            await client.prog_go(timeout=0.05)
+        assert not client.connected
 
 
 # ---------- flat-mode segment substitution (seg=0 → cached DS) ---------------

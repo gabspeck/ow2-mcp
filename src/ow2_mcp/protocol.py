@@ -9,6 +9,7 @@ No I/O — only byte manipulation. See OW2 sources for the authoritative referen
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 
@@ -155,6 +156,20 @@ def _latin1(s: str) -> bytes:
 
 def _latin1z(s: str) -> bytes:
     return _latin1(s) + b"\x00"
+
+
+def normalize_prog_load_argv(argv: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(argv, str):
+        raise ValueError("argv must be a sequence of strings, not a bare string")
+    items = tuple(argv)
+    if not items:
+        raise ValueError("argv must not be empty")
+    for index, item in enumerate(items):
+        if not isinstance(item, str):
+            raise ValueError(f"argv[{index}] must be a string")
+        if "\x00" in item:
+            raise ValueError(f"argv[{index}] must not contain NUL")
+    return items
 
 
 def _latin1_from(data: bytes) -> str:
@@ -1391,17 +1406,25 @@ def parse_prog_go_ret(data: bytes) -> ProgGoResult:
 # --- PROG_LOAD --------------------------------------------------------------
 
 
-def pack_prog_load_req(program: str, args: str = "", true_argv: bool = False) -> bytes:
+def pack_prog_load_req(argv: Sequence[str], true_argv: bool = False) -> bytes:
     """Encode a PROG_LOAD request.
 
-    Wire format: ``[u8 req][u8 true_argv][program\\0][args\\0]``. Always appends
-    a trailing NUL after ``args`` even when ``args`` is empty, so the minimum
-    payload for empty inputs is ``b"\\x0f\\x00\\x00\\x00"`` (4 bytes).
+    Wire format:
+
+    - ``true_argv=False``: ``[u8 req][u8 true_argv][arg0\\0][joined_tail\\0]``
+    - ``true_argv=True``: ``[u8 req][u8 true_argv][arg0\\0]...[argN\\0]``
+
+    ``argv`` must contain at least one element and no element may contain NUL.
     The in-memory ``0xFF`` sentinel from the OW2 debugger source is never
     transmitted.
     """
+    items = normalize_prog_load_argv(argv)
     header = bytes([Req.PROG_LOAD, 1 if true_argv else 0])
-    return header + _latin1(program) + b"\x00" + _latin1(args) + b"\x00"
+    if true_argv:
+        return header + b"".join(_latin1(item) + b"\x00" for item in items)
+    arg0 = _latin1(items[0]) + b"\x00"
+    tail = _latin1(" ".join(items[1:])) + b"\x00"
+    return header + arg0 + tail
 
 
 @dataclass(frozen=True, slots=True)

@@ -48,7 +48,7 @@ Add to `~/.claude/mcp.json`:
 }
 ```
 
-## Tool surface (15 tools)
+## Tool surface
 
 | Tool | Purpose |
 |---|---|
@@ -61,9 +61,10 @@ Add to `~/.claude/mcp.json`:
 | `trap_write_regs(data_hex)` | Write full register block (requires prior read) |
 | `trap_set_break(offset, segment=0)` | Set breakpoint, returns `old` |
 | `trap_clear_break(offset, old, segment=0)` | Clear breakpoint using saved `old` |
-| `trap_prog_go` | Run until stop/break/exception |
+| `trap_prog_go(timeout_ms?)` | Run until stop/break/exception, optionally with a timeout |
 | `trap_prog_step` | Single-step |
-| `trap_prog_load(program, args="", true_argv=False)` | Load an executable |
+| `trap_prog_load(argv, true_argv=False)` | Load an executable or send an attach token |
+| `trap_prog_attach(pid, hex_format=True)` | Attach to an existing process by integer or PID string |
 | `trap_prog_kill(task_id?)` | Kill loaded task (defaults to last loaded) |
 | `trap_get_err_text(error)` | Resolve TRAP error code to string |
 | `trap_get_message_text` | Pull queued server message |
@@ -76,7 +77,7 @@ prefixes, whitespace, underscores, and newlines.
 ```text
 trap_connect(host="10.0.0.5") →
 trap_get_sys_config →
-trap_prog_load("hello.exe") →
+trap_prog_load(argv=["hello.exe"]) →
 trap_read_mem(<entry>, 16) →
 trap_set_break(<addr>)            # save returned `old`
 trap_prog_go                      # expect conditions: ["BREAK"]
@@ -85,6 +86,11 @@ trap_clear_break(<addr>, <old>)
 trap_prog_kill
 trap_disconnect
 ```
+
+For explicit argv mode, use `trap_prog_load(argv=["hello.exe", "arg1", "arg2"], true_argv=True)`.
+For attach, use `trap_prog_attach(pid=0xFFF09CBF)` or `trap_prog_attach(pid="FFFE9DD7")`
+instead of manually building `#PID`.
+That attach token belongs in the first trailing `PROG_LOAD` field, not the old `args` slot.
 
 ## Development
 

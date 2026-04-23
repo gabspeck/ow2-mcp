@@ -57,17 +57,31 @@ def test_parse_connect_ret_too_short() -> None:
         p.parse_connect_ret(b"\x00")
 
 
-def test_pack_prog_load_req_canonical() -> None:
-    assert p.pack_prog_load_req("a.out", "hi") == b"\x0f\x00a.out\x00hi\x00"
+def test_pack_prog_load_req_joins_legacy_tail() -> None:
+    assert p.pack_prog_load_req(["a.out", "hi", "there"]) == b"\x0f\x00a.out\x00hi there\x00"
 
 
-def test_pack_prog_load_req_empty_is_4_bytes() -> None:
-    """Empty program and args still emit both NUL terminators."""
-    assert p.pack_prog_load_req("", "") == b"\x0f\x00\x00\x00"
+def test_pack_prog_load_req_attach_token_stays_in_first_string() -> None:
+    assert p.pack_prog_load_req(["#FFF09CBF"]) == b"\x0f\x00#FFF09CBF\x00\x00"
 
 
-def test_pack_prog_load_req_true_argv_flag() -> None:
-    assert p.pack_prog_load_req("x", "", true_argv=True) == b"\x0f\x01x\x00\x00"
+def test_pack_prog_load_req_true_argv_flag_serializes_every_item() -> None:
+    assert p.pack_prog_load_req(["x", "a", "b"], true_argv=True) == b"\x0f\x01x\x00a\x00b\x00"
+
+
+def test_pack_prog_load_req_rejects_empty_argv() -> None:
+    with pytest.raises(ValueError, match="argv must not be empty"):
+        p.pack_prog_load_req([])
+
+
+def test_pack_prog_load_req_rejects_bare_string() -> None:
+    with pytest.raises(ValueError, match="not a bare string"):
+        p.pack_prog_load_req("hello.exe")
+
+
+def test_pack_prog_load_req_rejects_nul_in_argument() -> None:
+    with pytest.raises(ValueError, match="must not contain NUL"):
+        p.pack_prog_load_req(["bad\x00arg"])
 
 
 def test_pack_read_mem_req_shape() -> None:

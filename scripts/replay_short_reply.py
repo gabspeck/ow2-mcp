@@ -1,7 +1,7 @@
 """Reproduce the short-reply failures we saw against a Win95 trap server.
 
 Drives the client through a full exercise of all trap tools:
-connect -> get_sys_config -> prog_load(NOTEPAD.EXE) -> read_regs -> write_regs ->
+connect -> get_sys_config -> prog_load([NOTEPAD.EXE]) -> read_regs -> write_regs ->
 read_mem -> prog_step -> read_regs -> prog_kill -> disconnect.
 
 Runs through the MITM proxy (default port 12341) so the wire dump lines up with the
@@ -12,11 +12,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import traceback
 
 from ow2_mcp import TrapClient
-from ow2_mcp.protocol import Addr48
 
 
 async def run(host: str, port: int, program: str) -> None:
@@ -35,7 +33,7 @@ async def run(host: str, port: int, program: str) -> None:
         print(cfg)
 
         step(f"prog_load {program}")
-        load = await client.prog_load(program)
+        load = await client.prog_load([program])
         print(load)
 
         step("read_regs #1")

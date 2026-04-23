@@ -1,4 +1,4 @@
-"""FastMCP server exposing 33 core TRAP tools over stdio."""
+"""FastMCP server exposing the core TRAP tools over stdio."""
 
 from __future__ import annotations
 
@@ -39,6 +39,42 @@ def _err(exc: TrapError) -> dict[str, Any]:
     if isinstance(exc, TrapServerError) and exc.trap_err_code is not None:
         error["trap_err_code"] = exc.trap_err_code
     return {"ok": False, "error": error}
+
+
+def _value_err(exc: ValueError) -> dict[str, Any]:
+    return {"ok": False, "error": {"code": "protocol_error", "message": str(exc)}}
+
+
+def _parse_attach_pid(pid: int | str) -> int:
+    if isinstance(pid, int):
+        value = pid
+    elif isinstance(pid, str):
+        text = pid.strip()
+        if not text:
+            raise ValueError("pid must not be empty")
+        if text.startswith("#"):
+            text = text[1:]
+            if not text:
+                raise ValueError("pid must include digits after '#'")
+            base = 16
+        elif text.lower().startswith("0x"):
+            text = text[2:]
+            if not text:
+                raise ValueError("pid must include digits after '0x'")
+            base = 16
+        elif any(ch in "abcdefABCDEF" for ch in text):
+            base = 16
+        else:
+            base = 10
+        try:
+            value = int(text, base)
+        except ValueError as exc:
+            raise ValueError(f"invalid pid: {pid!r}") from exc
+    else:
+        raise ValueError("pid must be an integer or string")
+    if value < 0:
+        raise ValueError("pid must be >= 0")
+    return value
 
 
 def _unhex(text: str) -> bytes:
@@ -478,12 +514,32 @@ def _go_result(result: Any) -> dict[str, Any]:
     }
 
 
+def _load_result(result: p.ProgLoadResult) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "err": result.err,
+        "task_id": result.task_id,
+        "mod_handle": result.mod_handle,
+        "flags": result.flags,
+        "load_flag_names": p.decode_load_flags(result.flags),
+    }
+
+
 @mcp.tool()
-async def trap_prog_go() -> dict[str, Any]:
+async def trap_prog_go(timeout_ms: int | None = None) -> dict[str, Any]:
     """Run the target until it hits a breakpoint, watchpoint, exception, or
-    termination. Returns SP, PC, and the decoded condition flags."""
+    termination. Returns SP, PC, and the decoded condition flags.
+
+    By default this blocks until the target stops. Pass ``timeout_ms`` to bound
+    the wait and surface expiry as a transport error.
+    """
     try:
-        result = await _client.prog_go()
+        if timeout_ms is not None and timeout_ms <= 0:
+            raise ValueError("timeout_ms must be > 0 or None")
+        timeout = None if timeout_ms is None else timeout_ms / 1000.0
+        result = await _client.prog_go(timeout=timeout)
+    except ValueError as exc:
+        return _value_err(exc)
     except TrapError as exc:
         return _err(exc)
     return _go_result(result)
@@ -500,26 +556,43 @@ async def trap_prog_step() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def trap_prog_load(
-    program: str, args: str = "", true_argv: bool = False
-) -> dict[str, Any]:
-    """Load ``program`` into the debugger with ``args``.
+async def trap_prog_load(argv: list[str], true_argv: bool = False) -> dict[str, Any]:
+    """Load or attach via TRAP ``PROG_LOAD`` using a structured argv vector.
+
+    With ``true_argv=False``, ``argv[0]`` is the program or attach token and
+    ``argv[1:]`` are joined into the legacy second trailing string. With
+    ``true_argv=True``, every argv element is serialized as its own NUL-terminated
+    string on the wire.
 
     Branch on the top-level ``ok`` AND on the inner ``err`` (a non-zero TRAP
     error code — the load failed server-side even if the wire reply was valid).
     """
     try:
-        result = await _client.prog_load(program, args, true_argv=true_argv)
+        p.normalize_prog_load_argv(argv)
+        result = await _client.prog_load(argv, true_argv=true_argv)
+    except ValueError as exc:
+        return _value_err(exc)
     except TrapError as exc:
         return _err(exc)
-    return {
-        "ok": True,
-        "err": result.err,
-        "task_id": result.task_id,
-        "mod_handle": result.mod_handle,
-        "flags": result.flags,
-        "load_flag_names": p.decode_load_flags(result.flags),
-    }
+    return _load_result(result)
+
+
+@mcp.tool()
+async def trap_prog_attach(pid: int | str, hex_format: bool = True) -> dict[str, Any]:
+    """Attach to an existing process through TRAP ``PROG_LOAD``.
+
+    Open Watcom trap servers encode attach as a special token in the first
+    trailing string. ``pid`` accepts an integer or string forms such as
+    ``"FFFE9DD7"``, ``"0xFFFE9DD7"``, or ``"#FFFE9DD7"``. Call this tool
+    instead of constructing ``#PID`` manually.
+    """
+    try:
+        result = await _client.prog_attach(_parse_attach_pid(pid), hex_format=hex_format)
+    except ValueError as exc:
+        return _value_err(exc)
+    except TrapError as exc:
+        return _err(exc)
+    return _load_result(result)
 
 
 @mcp.tool()

@@ -40,8 +40,8 @@ class PacketChannel:
         except (OSError, asyncio.IncompleteReadError) as exc:
             raise TransportError(f"send failed: {exc}") from exc
 
-    async def recv_packet(self) -> bytes:
-        try:
+    async def recv_packet(self, timeout: float | None = None) -> bytes:
+        async def _recv() -> bytes:
             header = await self._reader.readexactly(_HEADER)
             (length,) = struct.unpack("<H", header)
             if length > PACKET_MAX:
@@ -51,6 +51,13 @@ class PacketChannel:
             if length == 0:
                 return b""
             return await self._reader.readexactly(length)
+
+        try:
+            if timeout is None:
+                return await _recv()
+            return await asyncio.wait_for(_recv(), timeout=timeout)
+        except TimeoutError as exc:
+            raise TransportError(f"recv timed out after {timeout:g}s") from exc
         except asyncio.IncompleteReadError as exc:
             raise TransportError(
                 f"short read (expected {exc.expected}, got {len(exc.partial)})"
@@ -58,7 +65,31 @@ class PacketChannel:
         except OSError as exc:
             raise TransportError(f"recv failed: {exc}") from exc
 
-    async def close(self) -> None:
+    async def wait_peer_close(self, timeout: float) -> bool:
+        """Wait for the peer to close the stream.
+
+        Returns ``True`` on EOF, ``False`` on timeout, and raises
+        :class:`TransportError` on other socket failures.
+        """
+
+        async def _wait() -> bool:
+            data = await self._reader.read(1)
+            return data == b""
+
+        try:
+            return await asyncio.wait_for(_wait(), timeout=timeout)
+        except TimeoutError:
+            return False
+        except OSError as exc:
+            raise TransportError(f"recv failed: {exc}") from exc
+
+    async def close(self, *, abortive: bool = False) -> None:
+        if abortive:
+            sock = self._writer.get_extra_info("socket")
+            if sock is not None:
+                linger = struct.pack("ii", 1, 0)
+                with contextlib.suppress(OSError):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
         try:
             self._writer.close()
             await self._writer.wait_closed()

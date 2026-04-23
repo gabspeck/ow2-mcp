@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from . import protocol as p
@@ -51,6 +52,8 @@ from .protocol import (
 from .wire import PacketChannel, open_channel
 
 MapAddrSpace = str
+_DEFAULT_RECV_TIMEOUT = object()
+_DISCONNECT_CLOSE_WAIT = 0.25
 
 
 def _latin1z(text: str) -> bytes:
@@ -95,7 +98,9 @@ class TrapClient:
     request at a time. A single :class:`asyncio.Lock` serialises every RPC.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, recv_timeout: float | None = 5.0) -> None:
+        if recv_timeout is not None and recv_timeout <= 0:
+            raise ValueError("recv_timeout must be > 0 or None")
         self._channel: PacketChannel | None = None
         self._lock = asyncio.Lock()
         self._max_msg_size: int = p.PACKET_MAX
@@ -105,6 +110,7 @@ class TrapClient:
         self._flat_ds: int | None = None
         self._flat_cs: int | None = None
         self._supp_handles: dict[str, int] = {}
+        self._recv_timeout = recv_timeout
 
     @property
     def connected(self) -> bool:
@@ -125,6 +131,10 @@ class TrapClient:
     @property
     def endpoint(self) -> str | None:
         return self._endpoint
+
+    @property
+    def recv_timeout(self) -> float | None:
+        return self._recv_timeout
 
     @property
     def flat_ds(self) -> int | None:
@@ -182,11 +192,19 @@ class TrapClient:
         async with self._lock:
             if self._channel is None:
                 return
+            channel = self._channel
+            sent_disconnect = False
             with contextlib.suppress(TransportError):
-                await self._channel.send_packet(p.pack_disconnect_req())
-            await self._teardown_locked()
+                await channel.send_packet(p.pack_disconnect_req())
+                sent_disconnect = True
+            if sent_disconnect:
+                with contextlib.suppress(TransportError):
+                    if await channel.wait_peer_close(_DISCONNECT_CLOSE_WAIT):
+                        await self._teardown_locked()
+                        return
+            await self._teardown_locked(abortive=True)
 
-    async def _teardown_locked(self) -> None:
+    async def _teardown_locked(self, *, abortive: bool = False) -> None:
         """Close the channel and clear per-connection state. Caller holds the lock."""
         channel = self._channel
         self._channel = None
@@ -197,21 +215,29 @@ class TrapClient:
         self._supp_handles = {}
         self._endpoint = None
         if channel is not None:
-            await channel.close()
+            await channel.close(abortive=abortive)
 
     # --- RPC gate ------------------------------------------------------------
 
-    async def _rpc(self, payload: bytes, *, expect_reply: bool = True) -> bytes:
+    async def _rpc(
+        self,
+        payload: bytes,
+        *,
+        expect_reply: bool = True,
+        recv_timeout: float | None | object = _DEFAULT_RECV_TIMEOUT,
+    ) -> bytes:
         """Send ``payload``, return the reply. Tears down on socket failure."""
         async with self._lock:
             if self._channel is None:
                 raise NotConnectedError("no active TRAP connection")
             channel = self._channel
+            if recv_timeout is _DEFAULT_RECV_TIMEOUT:
+                recv_timeout = self._recv_timeout
             try:
                 await channel.send_packet(payload)
                 if not expect_reply:
                     return b""
-                return await channel.recv_packet()
+                return await channel.recv_packet(timeout=recv_timeout)
             except TransportError:
                 await self._teardown_locked()
                 raise
@@ -242,9 +268,19 @@ class TrapClient:
         self._supp_handles[service] = result.shandle
         return result.shandle
 
-    async def _supp_rpc(self, service: str, req: int, body: bytes = b"") -> bytes:
+    async def _supp_rpc(
+        self,
+        service: str,
+        req: int,
+        body: bytes = b"",
+        *,
+        recv_timeout: float | None | object = _DEFAULT_RECV_TIMEOUT,
+    ) -> bytes:
         shandle = await self._supp_handle(service)
-        return await self._rpc(p.pack_supplementary_req(shandle, req, body))
+        return await self._rpc(
+            p.pack_supplementary_req(shandle, req, body),
+            recv_timeout=recv_timeout,
+        )
 
     async def _resolve_flat_segment(self, segment: int) -> int:
         """Return ``segment`` unchanged unless it's 0 — then return the cached
@@ -437,21 +473,23 @@ class TrapClient:
         reply = await self._rpc(p.pack_split_cmd_req(command))
         return p.parse_split_cmd_ret(reply)
 
-    async def prog_go(self) -> ProgGoResult:
-        reply = await self._rpc(p.pack_prog_go_req())
+    async def prog_go(self, timeout: float | None = None) -> ProgGoResult:
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0 or None")
+        reply = await self._rpc(p.pack_prog_go_req(), recv_timeout=timeout)
         return p.parse_prog_go_ret(reply)
 
     async def prog_step(self) -> ProgGoResult:
-        reply = await self._rpc(p.pack_prog_step_req())
+        reply = await self._rpc(p.pack_prog_step_req(), recv_timeout=None)
         return p.parse_prog_go_ret(reply)
 
     async def prog_load(
         self,
-        program: str,
-        args: str = "",
+        argv: Sequence[str],
         true_argv: bool = False,
     ) -> ProgLoadResult:
-        req = p.pack_prog_load_req(program, args, true_argv=true_argv)
+        argv_items = p.normalize_prog_load_argv(argv)
+        req = p.pack_prog_load_req(argv_items, true_argv=true_argv)
         if len(req) > self._max_msg_size:
             raise ProtocolError(
                 f"prog_load payload ({len(req)} bytes) exceeds max_msg_size "
@@ -465,11 +503,17 @@ class TrapClient:
             task_id=result.task_id,
             mod_handle=result.mod_handle,
             flags=result.flags,
-            program=program,
+            program=argv_items[0],
         )
         self._flat_ds = None
         self._flat_cs = None
         return result
+
+    async def prog_attach(self, pid: int, hex_format: bool = True) -> ProgLoadResult:
+        if pid < 0:
+            raise ValueError("pid must be >= 0")
+        token = f"#{pid:X}" if hex_format else f"#{pid}"
+        return await self.prog_load([token])
 
     async def prog_kill(self, task_id: int | None = None) -> int:
         if task_id is None:
@@ -866,11 +910,11 @@ class TrapClient:
         return result
 
     async def async_go(self) -> ProgGoResult:
-        reply = await self._supp_rpc(p.SUPP_ASYNCH, p.AsyncReq.GO)
+        reply = await self._supp_rpc(p.SUPP_ASYNCH, p.AsyncReq.GO, recv_timeout=None)
         return p.parse_async_ret(reply)
 
     async def async_step(self) -> ProgGoResult:
-        reply = await self._supp_rpc(p.SUPP_ASYNCH, p.AsyncReq.STEP)
+        reply = await self._supp_rpc(p.SUPP_ASYNCH, p.AsyncReq.STEP, recv_timeout=None)
         return p.parse_async_ret(reply)
 
     async def async_poll(self) -> ProgGoResult:
